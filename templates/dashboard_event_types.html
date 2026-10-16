@@ -25,6 +25,7 @@
           {% if et.is_team %}<span class="badge badge-info" style="margin-left: 0.25rem;">{{ et.team_name }}</span>{% endif %}
           {% if not et.enabled %}<span class="badge badge-disabled">{{ t("event-types-badge-disabled") }}</span>{% endif %}
           {% if et.visibility == "internal" %}<span class="badge badge-info">{{ t("event-types-badge-internal") }}</span>{% endif %}
+          {% if et.visibility == "team" %}<span class="badge badge-info">{{ t("event-types-badge-team") }}</span>{% endif %}
           {% if et.visibility == "private" %}<span class="badge badge-muted">{{ t("event-types-badge-private") }}</span>{% endif %}
           {% if et.resource_names %}<span class="badge badge-muted" title="{{ et.resource_names }}">{{ t("event-types-badge-resources") }}</span>{% endif %}
           {% if et.visibility == "private" or et.visibility == "internal" %}

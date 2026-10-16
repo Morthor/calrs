@@ -3775,6 +3775,133 @@ async fn is_team_member(pool: &SqlitePool, user_id: &str, team_id: &str) -> bool
         > 0
 }
 
+async fn selectable_access_teams(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+) -> Vec<(String, String)> {
+    if user.role == "admin" {
+        sqlx::query_as("SELECT id, name FROM teams ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT t.id, t.name FROM teams t \
+             JOIN team_members tm ON tm.team_id = t.id \
+             WHERE tm.user_id = ? ORDER BY t.name",
+        )
+        .bind(&user.id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    }
+}
+
+fn access_teams_ctx(teams: &[(String, String)]) -> Vec<minijinja::Value> {
+    teams
+        .iter()
+        .map(|(id, name)| context! { id => id, name => name })
+        .collect()
+}
+
+async fn validated_access_team_ids(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+    submitted: Option<&str>,
+) -> Vec<String> {
+    let allowed: std::collections::HashSet<String> = selectable_access_teams(pool, user)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    submitted
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && allowed.contains(*id) && seen.insert((*id).to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+async fn selected_access_team_ids(pool: &SqlitePool, event_type_id: &str) -> String {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT team_id FROM event_type_access_teams WHERE event_type_id = ? ORDER BY team_id",
+    )
+    .bind(event_type_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .map(|(id,)| id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn replace_event_type_access_teams(
+    pool: &SqlitePool,
+    event_type_id: &str,
+    team_ids: &[String],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM event_type_access_teams WHERE event_type_id = ?")
+        .bind(event_type_id)
+        .execute(&mut *tx)
+        .await?;
+    for team_id in team_ids {
+        sqlx::query("INSERT INTO event_type_access_teams (event_type_id, team_id) VALUES (?, ?)")
+            .bind(event_type_id)
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+async fn can_access_team_event(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+    event_type_id: &str,
+) -> bool {
+    if user.role == "admin" {
+        return true;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM event_type_access_teams eta \
+         JOIN team_members tm ON tm.team_id = eta.team_id \
+         WHERE eta.event_type_id = ? AND tm.user_id = ?",
+    )
+    .bind(event_type_id)
+    .bind(&user.id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
+async fn team_event_access_denial(
+    pool: &SqlitePool,
+    user: Option<&crate::models::User>,
+    event_type_id: &str,
+    lang: &str,
+) -> Option<Response> {
+    let Some(user) = user else {
+        return Some(Redirect::to("/auth/login").into_response());
+    };
+    if can_access_team_event(pool, user, event_type_id).await {
+        None
+    } else {
+        Some(
+            Html(crate::i18n::translate(
+                lang,
+                "error-event-type-not-found",
+                None,
+            ))
+            .into_response(),
+        )
+    }
+}
+
 /// Check if a user has team-admin role for a specific team.
 async fn is_team_admin(pool: &SqlitePool, user_id: &str, team_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
@@ -4800,7 +4927,8 @@ struct EventTypeForm {
     min_notice_min: String,
     requires_confirmation: Option<String>, // checkbox: "on" or absent
     sms_phone_mode: Option<String>,        // checkbox: "on" or absent
-    visibility: Option<String>,            // "public", "internal", or "private"
+    visibility: Option<String>,            // "public", "internal", "private", or "team"
+    access_team_ids: Option<String>,       // comma-separated team IDs for "team" visibility
     location_type: Option<String>, // "link", "phone", "in_person", "custom", "jitsi_auto", "webhook_auto", "google_meet"
     location_value: Option<String>,
     // Optional per-event-type pattern override for the jitsi_auto provider.
@@ -5126,6 +5254,8 @@ async fn new_event_type_form(
     };
     let (resources_all, selected_resource_ids, resource_scheduling_mode) =
         resources_form_ctx(&state.pool, None, &attachable).await;
+    let access_teams = selectable_access_teams(&state.pool, user).await;
+    let access_teams = access_teams_ctx(&access_teams);
     let (impersonating, impersonating_name, _) = impersonation_ctx(&auth_user);
     Html(
         tmpl.render(context! {
@@ -5153,6 +5283,8 @@ async fn new_event_type_form(
             form_min_notice => 60,
             form_requires_confirmation => matches!(preset, "private"),
             form_visibility => match preset { "private" => "private", "internal" => "internal", _ => "public" },
+            access_teams => access_teams,
+            selected_access_team_ids => "",
             form_location_type => "link",
             form_location_value => "",
             form_meeting_pattern_override => "",
@@ -5319,9 +5451,22 @@ async fn create_event_type(
     }
 
     let visibility = match form.visibility.as_deref().unwrap_or("public") {
-        v @ ("public" | "internal" | "private") => v.to_string(),
+        v @ ("public" | "internal" | "private" | "team") => v.to_string(),
         _ => "public".to_string(),
     };
+    let access_team_ids =
+        validated_access_team_ids(&state.pool, user, form.access_team_ids.as_deref()).await;
+    if visibility == "team" && access_team_ids.is_empty() {
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &crate::i18n::translate(auth_user.lang, "form-error-access-team-required", None),
+            &form,
+            false,
+        )
+        .await
+        .into_response();
+    }
 
     let reminder_minutes = {
         let v = parse_int_field(&form.reminder_minutes, 0);
@@ -5384,6 +5529,20 @@ async fn create_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+
+    if let Err(e) = replace_event_type_access_teams(
+        &state.pool,
+        &et_id,
+        if visibility == "team" {
+            &access_team_ids
+        } else {
+            &[]
+        },
+    )
+    .await
+    {
+        return internal_error_response("save event type team access", &e);
+    }
 
     tracing::info!(slug = %slug, user = %auth_user.user.email, "event type created");
 
@@ -5781,6 +5940,9 @@ async fn edit_event_type_form(
     .await;
     let (resources_all, selected_resource_ids2, resource_scheduling_mode) =
         resources_form_ctx(&state.pool, Some(&et_id), &attachable).await;
+    let access_teams = selectable_access_teams(&state.pool, user).await;
+    let access_teams = access_teams_ctx(&access_teams);
+    let selected_access_team_ids = selected_access_team_ids(&state.pool, &et_id).await;
     Html(
         tmpl.render(context! {
             editing => true,
@@ -5810,6 +5972,8 @@ async fn edit_event_type_form(
             .unwrap_or(None)
             .unwrap_or_else(|| crate::sms::phone_mode::OFF.to_string()),
             form_visibility => visibility,
+            access_teams => access_teams,
+            selected_access_team_ids => selected_access_team_ids,
             form_location_type => loc_type,
             form_location_value => loc_value.unwrap_or_default(),
             form_meeting_pattern_override => meeting_pattern_override.clone().unwrap_or_default(),
@@ -5889,9 +6053,22 @@ async fn update_event_type(
     )
     .await;
     let visibility = match form.visibility.as_deref().unwrap_or("public") {
-        v @ ("public" | "internal" | "private") => v.to_string(),
+        v @ ("public" | "internal" | "private" | "team") => v.to_string(),
         _ => "public".to_string(),
     };
+    let access_team_ids =
+        validated_access_team_ids(&state.pool, user, form.access_team_ids.as_deref()).await;
+    if visibility == "team" && access_team_ids.is_empty() {
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &crate::i18n::translate(auth_user.lang, "form-error-access-team-required", None),
+            &form,
+            true,
+        )
+        .await
+        .into_response();
+    }
 
     // Check slug uniqueness if changed
     if new_slug != slug {
@@ -6006,6 +6183,20 @@ async fn update_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+
+    if let Err(e) = replace_event_type_access_teams(
+        &state.pool,
+        &et_id,
+        if visibility == "team" {
+            &access_team_ids
+        } else {
+            &[]
+        },
+    )
+    .await
+    {
+        return internal_error_response("save event type team access", &e);
+    }
 
     // Update availability rules: delete old, insert new. Pass the user's
     // profile-default schedule as a fallback so an empty submission falls back
@@ -7479,6 +7670,8 @@ async fn render_event_type_form_error(
         .iter()
         .map(|(id, name)| context! { id => id, name => name })
         .collect();
+    let access_teams = selectable_access_teams(&state.pool, &auth_user.user).await;
+    let access_teams = access_teams_ctx(&access_teams);
 
     let (impersonating, impersonating_name, _) = impersonation_ctx(auth_user);
     Html(
@@ -7500,6 +7693,8 @@ async fn render_event_type_form_error(
             form_requires_confirmation => form.requires_confirmation.as_deref() == Some("on"),
             form_sms_phone_mode => crate::sms::phone_mode::parse(form.sms_phone_mode.as_deref().unwrap_or("")),
             form_visibility => form.visibility.as_deref().unwrap_or("public"),
+            access_teams => access_teams,
+            selected_access_team_ids => form.access_team_ids.as_deref().unwrap_or(""),
             form_location_type => form.location_type.as_deref().unwrap_or("link"),
             form_location_value => form.location_value.as_deref().unwrap_or(""),
             form_meeting_pattern_override => form.meeting_pattern_override.as_deref().unwrap_or(""),
@@ -8479,6 +8674,8 @@ async fn new_group_event_type_form(
         .iter()
         .map(|(id, name)| context! { id => id, name => name })
         .collect();
+    let access_teams = selectable_access_teams(&state.pool, user).await;
+    let access_teams = access_teams_ctx(&access_teams);
 
     // Pre-fill availability from user's default schedule
     ensure_user_avail_seeded(&state.pool, &user.id).await;
@@ -8523,6 +8720,9 @@ async fn new_group_event_type_form(
             form_buffer_after => 0,
             form_min_notice => 60,
             form_requires_confirmation => false,
+            form_visibility => "public",
+            access_teams => access_teams,
+            selected_access_team_ids => "",
             form_location_type => "link",
             form_location_value => "",
             form_meeting_pattern_override => "",
@@ -8667,6 +8867,24 @@ async fn create_group_event_type(
             .into_response();
     }
 
+    let visibility = match form.visibility.as_deref().unwrap_or("public") {
+        v @ ("public" | "internal" | "private" | "team") => v.to_string(),
+        _ => "public".to_string(),
+    };
+    let access_team_ids =
+        validated_access_team_ids(&state.pool, user, form.access_team_ids.as_deref()).await;
+    if visibility == "team" && access_team_ids.is_empty() {
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &crate::i18n::translate(auth_user.lang, "form-error-access-team-required", None),
+            &form,
+            false,
+        )
+        .await
+        .into_response();
+    }
+
     let default_calendar_view = match form.default_calendar_view.as_deref().unwrap_or("month") {
         v @ ("month" | "week" | "column") => v.to_string(),
         _ => "month".to_string(),
@@ -8688,8 +8906,8 @@ async fn create_group_event_type(
         .map(str::to_string);
 
     let _ = sqlx::query(
-        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode, booking_horizon_days)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, visibility, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode, booking_horizon_days)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&et_id)
     .bind(&account_id)
@@ -8706,6 +8924,7 @@ async fn create_group_event_type(
     .bind(location_value)
     .bind(&team_id)
     .bind(&user.id)
+    .bind(&visibility)
     .bind(&default_calendar_view)
     .bind(first_slot_only as i32)
     .bind(&timezone)
@@ -8716,6 +8935,20 @@ async fn create_group_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+
+    if let Err(e) = replace_event_type_access_teams(
+        &state.pool,
+        &et_id,
+        if visibility == "team" {
+            &access_team_ids
+        } else {
+            &[]
+        },
+    )
+    .await
+    {
+        return internal_error_response("save event type team access", &e);
+    }
 
     // Create availability rules. Pass the creating user's profile-default
     // schedule as a fallback so an empty submission falls back to it instead
@@ -9079,6 +9312,9 @@ async fn edit_group_event_type_form(
     .await;
     let (resources_all, selected_resource_ids, resource_scheduling_mode) =
         resources_form_ctx(&state.pool, Some(&et_id), &attachable).await;
+    let access_teams = selectable_access_teams(&state.pool, user).await;
+    let access_teams = access_teams_ctx(&access_teams);
+    let selected_access_team_ids = selected_access_team_ids(&state.pool, &et_id).await;
     let (impersonating, impersonating_name, _) = impersonation_ctx(&auth_user);
     Html(
         tmpl.render(context! {
@@ -9101,6 +9337,8 @@ async fn edit_group_event_type_form(
             form_min_notice => min_notice,
             form_requires_confirmation => requires_conf != 0,
             form_visibility => visibility,
+            access_teams => access_teams,
+            selected_access_team_ids => selected_access_team_ids,
             form_location_type => loc_type,
             form_location_value => loc_value.unwrap_or_default(),
             form_meeting_pattern_override => meeting_pattern_override.clone().unwrap_or_default(),
@@ -9194,7 +9432,23 @@ async fn update_group_event_type(
         Some(&et_id),
     )
     .await;
-    let visibility = form.visibility.as_deref().unwrap_or("public").to_string();
+    let visibility = match form.visibility.as_deref().unwrap_or("public") {
+        v @ ("public" | "internal" | "private" | "team") => v.to_string(),
+        _ => "public".to_string(),
+    };
+    let access_team_ids =
+        validated_access_team_ids(&state.pool, user, form.access_team_ids.as_deref()).await;
+    if visibility == "team" && access_team_ids.is_empty() {
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &crate::i18n::translate(auth_user.lang, "form-error-access-team-required", None),
+            &form,
+            true,
+        )
+        .await
+        .into_response();
+    }
 
     // Check slug uniqueness within the team if changed
     if new_slug != slug {
@@ -9313,6 +9567,20 @@ async fn update_group_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+
+    if let Err(e) = replace_event_type_access_teams(
+        &state.pool,
+        &et_id,
+        if visibility == "team" {
+            &access_team_ids
+        } else {
+            &[]
+        },
+    )
+    .await
+    {
+        return internal_error_response("save event type team access", &e);
+    }
 
     // Update availability rules. Pass the editing user's profile-default
     // schedule as a fallback so an empty submission falls back to it instead
@@ -9643,34 +9911,37 @@ async fn team_profile_page(
         }
     }
 
-    // Logged-in team members (and global admins) see all enabled event types,
-    // including private/internal — they have view access via the slot pages
-    // anyway, so showing them on the profile makes them discoverable. Anonymous
-    // visitors and non-members continue to see only public event types.
-    let event_types: Vec<(String, String, Option<String>, i32, String)> =
-        if viewer_is_member_or_admin {
-            sqlx::query_as(
-                "SELECT et.slug, et.title, et.description, et.duration_min, et.visibility
-             FROM event_types et
-             WHERE et.team_id = ? AND et.enabled = 1
-             ORDER BY et.created_at",
-            )
-            .bind(&team_id)
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-        } else {
-            sqlx::query_as(
-                "SELECT et.slug, et.title, et.description, et.duration_min, et.visibility
-             FROM event_types et
-             WHERE et.team_id = ? AND et.enabled = 1 AND et.visibility = 'public'
-             ORDER BY et.created_at",
-            )
-            .bind(&team_id)
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-        };
+    // Logged-in team members (and global admins) see all enabled non-team-access
+    // event types, including private/internal. Anonymous visitors and non-members
+    // continue to see only public event types. Selected-team events are only
+    // discoverable by members of one of their explicitly allowed teams.
+    let viewer_id = optional_auth.user.as_ref().map(|user| user.id.as_str());
+    let viewer_is_admin = optional_auth
+        .user
+        .as_ref()
+        .is_some_and(|user| user.role == "admin");
+    let event_types: Vec<(String, String, Option<String>, i32, String)> = sqlx::query_as(
+        "SELECT et.slug, et.title, et.description, et.duration_min, et.visibility
+         FROM event_types et
+         WHERE et.team_id = ? AND et.enabled = 1 AND (
+             ? = 1 OR
+             (? = 1 AND et.visibility IN ('public', 'private', 'internal')) OR
+             et.visibility = 'public' OR
+             (et.visibility = 'team' AND EXISTS (
+                 SELECT 1 FROM event_type_access_teams eta
+                 JOIN team_members tm ON tm.team_id = eta.team_id
+                 WHERE eta.event_type_id = et.id AND tm.user_id = ?
+             ))
+         )
+         ORDER BY et.created_at",
+    )
+    .bind(&team_id)
+    .bind(viewer_is_admin as i32)
+    .bind(viewer_is_member_or_admin as i32)
+    .bind(viewer_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
 
     let members: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT u.id, u.name, u.avatar_path FROM users u \
@@ -9810,6 +10081,14 @@ async fn show_group_slots(
         }
     };
 
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
+
     // Global admins can view any team event type (matches their management
     // surface). Booking is still invite-gated for private/internal events;
     // global admins do not auto-bypass the booking gate.
@@ -9863,6 +10142,7 @@ async fn show_group_slots(
     //   any team + private/internal event → booking invite OR logged-in team member (view only)
     let can_view = match (team_visibility.as_str(), visibility.as_str()) {
         (_, "private") | (_, "internal") => has_valid_booking_invite || is_logged_in_team_member,
+        (_, "team") => true,
         ("private", _) => has_valid_team_invite || is_logged_in_team_member,
         _ => true,
     };
@@ -10127,6 +10407,14 @@ async fn show_group_book_form(
         }
     };
 
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
+
     // Logged-in team members (and global admins) substitute for the team
     // invite token on public events of private teams. Private/internal events
     // still require a valid booking-invite token regardless of team membership.
@@ -10175,7 +10463,7 @@ async fn show_group_book_form(
                 invite_guest_email = Some(email);
             }
         }
-    } else if team_visibility == "private" && !viewer_is_member_or_admin {
+    } else if visibility != "team" && team_visibility == "private" && !viewer_is_member_or_admin {
         // Public event type on a private team — needs the team invite token
         // unless the viewer is a logged-in team member or global admin.
         let valid = matches!((&team_invite_token, &query.invite), (Some(expected), Some(provided)) if !provided.is_empty() && provided == expected);
@@ -10357,6 +10645,13 @@ async fn handle_group_booking(
             .into_response()
         }
     };
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
     let needs_approval = requires_confirmation != 0;
     let sms_phone_mode: String =
         sqlx::query_scalar("SELECT sms_phone_mode FROM event_types WHERE id = ?")
@@ -10428,7 +10723,7 @@ async fn handle_group_booking(
                 }
             }
         }
-    } else if team_visibility == "private" {
+    } else if visibility != "team" && team_visibility == "private" {
         // Public event on a private team: logged-in team members and global
         // admins bypass the team invite token requirement (their team
         // membership is the access). Private/internal events above already
@@ -10978,6 +11273,7 @@ async fn redirect_user_profile_trailing_slash(uri: axum::http::Uri) -> Redirect 
 
 async fn user_profile(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path(username): Path<String>,
 ) -> impl IntoResponse {
@@ -11007,16 +11303,31 @@ async fn user_profile(
         }
     };
     let lang = crate::i18n::resolve(language.as_deref(), &headers);
+    let viewer_id = optional_auth.user.as_ref().map(|user| user.id.as_str());
+    let viewer_is_admin = optional_auth
+        .user
+        .as_ref()
+        .is_some_and(|user| user.role == "admin");
 
     let event_types: Vec<(String, String, Option<String>, i32)> = sqlx::query_as(
         "SELECT et.slug, et.title, et.description, et.duration_min
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
-         WHERE a.user_id = ? AND et.enabled = 1 AND et.visibility = 'public'
+         WHERE a.user_id = ? AND et.enabled = 1
          AND et.team_id IS NULL
+         AND (
+             et.visibility = 'public' OR
+             (et.visibility = 'team' AND (? = 1 OR EXISTS (
+                 SELECT 1 FROM event_type_access_teams eta
+                 JOIN team_members tm ON tm.team_id = eta.team_id
+                 WHERE eta.event_type_id = et.id AND tm.user_id = ?
+             )))
+         )
          ORDER BY et.created_at",
     )
     .bind(&user_id)
+    .bind(viewer_is_admin as i32)
+    .bind(viewer_id)
     .fetch_all(&state.pool)
     .await
     .unwrap_or_default();
@@ -11983,6 +12294,7 @@ async fn handle_dynamic_group_booking(
 
 async fn show_slots_for_user(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<SlotsQuery>,
@@ -12062,6 +12374,14 @@ async fn show_slots_for_user(
             .into_response()
         }
     };
+
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
 
     // Validate invite token for private event types
     let invite_guest_name;
@@ -12232,6 +12552,7 @@ async fn show_slots_for_user(
 
 async fn show_book_form_for_user(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: HeaderMap,
     Path((username, slug)): Path<(String, String)>,
     Query(query): Query<BookQuery>,
@@ -12281,6 +12602,14 @@ async fn show_book_form_for_user(
     };
 
     let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
 
     // Validate invite token for private event types
     let invite_guest_name;
@@ -12418,6 +12747,7 @@ async fn show_book_form_for_user(
 
 async fn handle_booking_for_user(
     State(state): State<Arc<AppState>>,
+    optional_auth: crate::auth::OptionalAuthUser,
     headers: axum::http::HeaderMap,
     Path((username, slug)): Path<(String, String)>,
     Query(embed): Query<EmbedParams>,
@@ -12504,6 +12834,13 @@ async fn handle_booking_for_user(
     };
 
     let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
+    if visibility == "team" {
+        if let Some(response) =
+            team_event_access_denial(&state.pool, optional_auth.user.as_ref(), &et_id, lang).await
+        {
+            return response;
+        }
+    }
     let needs_approval = requires_confirmation != 0;
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
     let phone_to_store = match resolve_guest_phone(
@@ -14574,6 +14911,14 @@ async fn show_slots(
         }
     };
 
+    // Block team-access event types on the legacy route.
+    if visibility == "team" {
+        return Html(crate::i18n::translate(
+            lang,
+            "error-event-type-not-found",
+            None,
+        ));
+    }
     // Block private event types on legacy route (use /u/ or /team/ routes with invite token instead)
     if visibility == "private" || visibility == "internal" {
         return Html(crate::i18n::translate(lang, "error-invite-required", None));
@@ -14766,6 +15111,14 @@ async fn show_book_form(
         }
     };
 
+    // Block team-access event types on the legacy route.
+    if visibility == "team" {
+        return Html(crate::i18n::translate(
+            lang,
+            "error-event-type-not-found",
+            None,
+        ));
+    }
     // Block non-public event types on legacy route
     if visibility == "private" || visibility == "internal" {
         return Html(crate::i18n::translate(lang, "error-invite-required", None));
@@ -15185,6 +15538,15 @@ async fn handle_booking(
         }
     };
 
+    // Block team-access event types on the legacy route.
+    if visibility == "team" {
+        return Html(crate::i18n::translate(
+            lang,
+            "error-event-type-not-found",
+            None,
+        ))
+        .into_response();
+    }
     // Block non-public event types on legacy route
     if visibility == "private" || visibility == "internal" {
         return Html(crate::i18n::translate(lang, "error-invite-required", None)).into_response();
@@ -23353,6 +23715,33 @@ mod tests {
         (team_id, et_id)
     }
 
+    async fn insert_team_only(
+        pool: &SqlitePool,
+        team_slug: &str,
+        members: &[(&str, &str)],
+    ) -> String {
+        let team_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO teams (id, name, slug, visibility) VALUES (?, ?, ?, 'public')")
+            .bind(&team_id)
+            .bind(team_slug)
+            .bind(team_slug)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (user_id, role) in members {
+            sqlx::query(
+                "INSERT INTO team_members (team_id, user_id, role, source) VALUES (?, ?, ?, 'direct')",
+            )
+            .bind(&team_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        team_id
+    }
+
     async fn user_for(pool: &SqlitePool, user_id: &str) -> crate::models::User {
         sqlx::query_as("SELECT * FROM users WHERE id = ?")
             .bind(user_id)
@@ -28957,6 +29346,21 @@ mod tests {
         (router, pool, session_token, et_id)
     }
 
+    async fn insert_test_session(pool: &SqlitePool, user_id: &str) -> String {
+        let session_token = uuid::Uuid::new_v4().to_string();
+        let expires_at = (Utc::now() + Duration::days(30))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
+            .bind(&session_token)
+            .bind(user_id)
+            .bind(&expires_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        session_token
+    }
+
     fn get(uri: &str) -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .uri(uri)
@@ -31976,6 +32380,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "No booking should be created without invite");
+    }
+
+    #[tokio::test]
+    async fn selected_team_event_requires_membership_and_allows_direct_booking() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let member_id = insert_role_user(&pool, "member@x", "user").await;
+        let outsider_id = insert_role_user(&pool, "outsider@x", "user").await;
+        let member_session = insert_test_session(&pool, &member_id).await;
+        let outsider_session = insert_test_session(&pool, &outsider_id).await;
+        let access_team_id =
+            insert_team_only(&pool, "allowed-team", &[(&member_id, "member")]).await;
+
+        sqlx::query("UPDATE event_types SET visibility = 'team' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO event_type_access_teams (event_type_id, team_id) VALUES (?, ?)")
+            .bind(&et_id)
+            .bind(&access_team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get("/u/testuser/test-meeting"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 303);
+        assert_eq!(response.headers().get("location").unwrap(), "/auth/login");
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/u/testuser/test-meeting", &outsider_session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(body_string(response).await.contains("not found"));
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/u/testuser", &member_session))
+            .await
+            .unwrap();
+        assert!(body_string(response).await.contains("Test Meeting"));
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/u/testuser", &outsider_session))
+            .await
+            .unwrap();
+        assert!(!body_string(response).await.contains("Test Meeting"));
+
+        let now = Utc::now().with_timezone(&Tz::UTC).naive_local();
+        let mut booking_day = now.date() + Duration::days(1);
+        while booking_day.weekday() == chrono::Weekday::Sat
+            || booking_day.weekday() == chrono::Weekday::Sun
+        {
+            booking_day += Duration::days(1);
+        }
+        let csrf = "selected-team-booking";
+        let body = format!(
+            "_csrf={}&date={}&time=10%3A00&name=Team+Member&email=member%40example.com&notes=",
+            csrf,
+            booking_day.format("%Y-%m-%d")
+        );
+        let response = app
+            .oneshot(post_form(
+                "/u/testuser/test-meeting/book",
+                &member_session,
+                csrf,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let booking_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bookings WHERE event_type_id = ?")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(booking_count, 1);
+    }
+
+    #[tokio::test]
+    async fn selected_team_members_can_open_team_owned_events() {
+        let (app, pool, _, _) = setup_test_app().await;
+        let member_id = insert_role_user(&pool, "team-member@x", "user").await;
+        let outsider_id = insert_role_user(&pool, "team-outsider@x", "user").await;
+        let member_session = insert_test_session(&pool, &member_id).await;
+        let outsider_session = insert_test_session(&pool, &outsider_id).await;
+        let access_team_id =
+            insert_team_only(&pool, "access-team", &[(&member_id, "member")]).await;
+        let (_, event_type_id) = insert_team_with_et(&pool, "host-team", "consultation", &[]).await;
+        sqlx::query("UPDATE teams SET visibility = 'private' WHERE slug = 'host-team'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE event_types SET visibility = 'team' WHERE id = ?")
+            .bind(&event_type_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO event_type_access_teams (event_type_id, team_id) VALUES (?, ?)")
+            .bind(&event_type_id)
+            .bind(&access_team_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get_authed("/team/host-team/consultation", &member_session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(body_string(response).await.contains("consultation"));
+
+        let response = app
+            .oneshot(get_authed(
+                "/team/host-team/consultation",
+                &outsider_session,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(body_string(response).await.contains("not found"));
     }
 
     #[tokio::test]

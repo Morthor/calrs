@@ -76,7 +76,11 @@
   </div>
   <p class="subtitle" style="margin-bottom: 1rem;">Generate a snippet to embed this event type on your own website.</p>
 
-  {% if visibility != "public" %}
+  {% if visibility == "team" %}
+  <div class="error" style="margin-bottom: 1rem;">
+    Heads up: this event type is limited to selected teams. Embedded visitors must be signed in and belong to an allowed team.
+  </div>
+  {% elif visibility != "public" %}
   <div class="error" style="margin-bottom: 1rem;">
     Heads up: this event type is <strong>{{ visibility }}</strong>. Embedded visitors will need a valid invite link to book — the generated snippet won't carry one. Consider switching visibility to public for direct embedding.
   </div>
